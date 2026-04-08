@@ -22,6 +22,7 @@
 ---
 
 ## Что нового в этом форке
+<img width="836" height="721" alt="image" src="https://github.com/user-attachments/assets/787b6fed-5856-4798-9faa-acf48085670f" />
 
 ### Поддержка нескольких ловушек (камер)
 
