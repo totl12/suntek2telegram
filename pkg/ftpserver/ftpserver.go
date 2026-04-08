@@ -4,70 +4,92 @@ import (
 	"bytes"
 	"io"
 	"log"
-	"suntek2telegram/pkg/config"
+	"sync"
 
 	"goftp.io/server/v2"
+	"suntek2telegram/pkg/config"
+	"suntek2telegram/pkg/database"
+	"suntek2telegram/pkg/events"
 )
 
-type (
-	MyAuth   struct{}
-	MyPerm   struct{}
-	MyDriver struct{}
-)
+// TrapLookup is provided by the manager to resolve credentials to a trap.
+type TrapLookup struct {
+	ByCredentials func(username, password string) *database.Trap
+}
 
-var (
-	ftpConf           *config.FTP
-	imagesReadersChan chan io.Reader
-)
+type singleAuth struct {
+	lookup   TrapLookup
+	sessions sync.Map // *server.Session → *database.Trap
+}
 
-func Start(fc *config.FTP, imgReadersChan chan io.Reader) {
-	ftpConf = fc
-	imagesReadersChan = imgReadersChan
+type singlePerm struct{}
 
-	myDriver := &MyDriver{}
-	myPerm := &MyPerm{}
-	myAuth := &MyAuth{}
+type singleDriver struct {
+	sessions *sync.Map
+	ch       chan<- events.ImageEvent
+}
+
+// Start launches the shared FTP server. Returns a stop function.
+func Start(cfg *config.FTPServer, lookup TrapLookup, ch chan<- events.ImageEvent) (func(), error) {
+	auth := &singleAuth{lookup: lookup}
+	driver := &singleDriver{sessions: &auth.sessions, ch: ch}
+
 	opts := &server.Options{
-		Driver: myDriver,
-		Perm:   myPerm,
-		Auth:   myAuth,
-
-		Port:     fc.BindPort,
-		Hostname: fc.BindHost,
-
-		PassivePorts: fc.PassivePorts,
-		PublicIP:     fc.PublicIP,
+		Driver:       driver,
+		Perm:         &singlePerm{},
+		Auth:         auth,
+		Port:         cfg.BindPort,
+		Hostname:     cfg.BindHost,
+		PassivePorts: cfg.PassivePorts,
+		PublicIP:     cfg.PublicIP,
 	}
 
-	server, err := server.NewServer(opts)
+	srv, err := server.NewServer(opts)
 	if err != nil {
-		log.Fatalln(err)
+		return nil, err
 	}
 
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalln("Failed to start FTP server:", err)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("FTP server stopped: %v", err)
+		}
+	}()
+
+	log.Printf("FTP server started on %s:%d", cfg.BindHost, cfg.BindPort)
+	return func() { srv.Shutdown() }, nil
+}
+
+func (a *singleAuth) CheckPasswd(ctx *server.Context, username, password string) (bool, error) {
+	t := a.lookup.ByCredentials(username, password)
+	if t == nil {
+		return false, nil
 	}
+	a.sessions.Store(ctx.Sess, t)
+	return true, nil
 }
 
-func (auth *MyAuth) CheckPasswd(ctx *server.Context, s1, s2 string) (bool, error) {
-	result := s1 == ftpConf.Username && s2 == ftpConf.Password
-	return result, nil
-}
+func (d *singleDriver) PutFile(ctx *server.Context, destPath string, data io.Reader, appendData int64) (int64, error) {
+	val, ok := d.sessions.Load(ctx.Sess)
+	if !ok {
+		return 0, nil
+	}
+	t := val.(*database.Trap)
 
-func (driver *MyDriver) PutFile(ctx *server.Context, destPath string, data io.Reader, appendData int64) (int64, error) {
 	var buf bytes.Buffer
 	copied, err := io.Copy(&buf, data)
 	if err != nil {
 		return copied, err
 	}
 
-	newReader := bytes.NewReader(buf.Bytes())
-	imagesReadersChan <- newReader
+	d.ch <- events.ImageEvent{
+		TrapID:   t.ID,
+		TrapName: t.Name,
+		ChatID:   t.ChatID,
+		Data:     buf.Bytes(),
+	}
 
-	// Workaround - because camera do not have keep-alive mechanism (and NAT is ALWAYS used with
-	// mobile operators), so let's just close connection after each image, so it re-establishes it
-	// for each image
+	// Close after each image — camera firmware has no keep-alive through mobile NAT.
+	d.sessions.Delete(ctx.Sess)
 	ctx.Sess.Close()
-
 	return copied, nil
 }

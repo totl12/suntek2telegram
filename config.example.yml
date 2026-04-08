@@ -1,24 +1,31 @@
-# This is Telegram bot API key and ChatID.
+# Telegram bot API key (required)
 telegram:
   api_key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  chat_id: 1234567890
 
-# Configure FTP server
+# Shared FTP server — all FTP traps connect here, identified by credentials.
 ftp:
-  enabled: false
+  enabled: true
   bind_host: "0.0.0.0"
   bind_port: 21
-  username: camera
-  password: camerapass
-  # Camera is using passive mode. Public IP and port range is what going
-  # to be advertised to FTP client AND used to upload images...
-  public_ip: "123.123.123.123"
-  passive_ports: 4100-4199
+  public_ip: "1.2.3.4"        # public IP for passive mode (PASV)
+  passive_ports: "4100-4199"   # passive port range
 
-# Configure SMTP server
+# Shared SMTP server — all SMTP traps connect here, identified by credentials.
 smtp:
   enabled: false
   bind_host: "0.0.0.0"
   bind_port: 25
-  username: camera
-  password: camerapass
+
+# Web interface (trap management + photo history)
+web:
+  bind_host: "0.0.0.0"
+  bind_port: 8080
+  # Leave both empty to disable login.
+  username: "admin"
+  password: "changeme"
+
+# SQLite database path
+db_path: "./data/suntek.db"
+
+# Directory where received photos are saved
+photos_dir: "./data/photos"

@@ -12,192 +12,195 @@ import (
 	"net/mail"
 	"strconv"
 	"strings"
+
 	"suntek2telegram/pkg/config"
+	"suntek2telegram/pkg/database"
+	"suntek2telegram/pkg/events"
 )
 
-var (
-	imagesReadersChan chan io.Reader
+// TrapLookup resolves credentials to a trap.
+type TrapLookup struct {
+	ByCredentials func(username, password string) *database.Trap
+}
 
-	usernameBase64 string
-	passwordBase64 string
-)
+type smtpServer struct {
+	lookup TrapLookup
+	ch     chan<- events.ImageEvent
+}
 
-func Start(sc *config.SMTP, readersChan chan io.Reader) {
-	imagesReadersChan = readersChan
-
-	usernameBase64 = base64.StdEncoding.EncodeToString([]byte(sc.Username))
-	passwordBase64 = base64.StdEncoding.EncodeToString([]byte(sc.Password))
-
-	listener, err := net.Listen("tcp", sc.BindHost+":"+strconv.Itoa(sc.BindPort))
+// Start launches the shared SMTP server. Returns a stop function.
+func Start(cfg *config.SMTPServer, lookup TrapLookup, ch chan<- events.ImageEvent) (func(), error) {
+	listener, err := net.Listen("tcp", cfg.BindHost+":"+strconv.Itoa(cfg.BindPort))
 	if err != nil {
-		log.Fatalln("Failed to start SMTP listener", err)
+		return nil, err
 	}
-	log.Println("SMTP TCP listener started on", sc.BindHost+":"+strconv.Itoa(sc.BindPort))
+	log.Printf("SMTP server started on %s:%d", cfg.BindHost, cfg.BindPort)
 
+	srv := &smtpServer{lookup: lookup, ch: ch}
+	go srv.serve(listener)
+
+	return func() { listener.Close() }, nil
+}
+
+func (s *smtpServer) serve(listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Error accepting connection:", err)
-			continue
+			return // listener closed
 		}
-		log.Println("Connection established from", conn.RemoteAddr())
-
-		go handleConn(conn)
+		log.Printf("SMTP connection from %s", conn.RemoteAddr())
+		go s.handleConn(conn)
 	}
 }
 
-func sendAndReceive(writer *bufio.Writer, reader *bufio.Reader, message string, expected string) (string, error) {
-	writer.WriteString(message + "\r\n")
-	writer.Flush()
-	log.Println("Sent:", message)
-
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	log.Println("Received:", line)
-
-	if !strings.Contains(line, expected) {
-		return "", err
-	}
-
-	return line, nil
-}
-
-func handleConn(conn net.Conn) {
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+func (s *smtpServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	_, err := sendAndReceive(writer, reader, "220 Hello", "EHLO")
-	if err != nil {
-		log.Println("Failed to read:", err)
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	if _, err := sendAndReceive(writer, reader, "220 Hello", "EHLO"); err != nil {
+		return
+	}
+	if _, err := sendAndReceive(writer, reader, "250 OK", "AUTH LOGIN"); err != nil {
 		return
 	}
 
-	_, err = sendAndReceive(writer, reader, "250 OK", "AUTH LOGIN")
+	// Receive username (base64)
+	usernameB64Line, err := sendAndReceive(writer, reader, "334 Username", "")
 	if err != nil {
-		log.Println("Failed to read:", err)
+		return
+	}
+	// Receive password (base64)
+	passwordB64Line, err := sendAndReceive(writer, reader, "334 Password", "")
+	if err != nil {
 		return
 	}
 
-	_, err = sendAndReceive(writer, reader, "334 Username", usernameBase64)
-	if err != nil {
-		log.Println("Failed to read:", err)
+	usernameRaw, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(usernameB64Line))
+	passwordRaw, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(passwordB64Line))
+	username := string(usernameRaw)
+	password := string(passwordRaw)
+
+	t := s.lookup.ByCredentials(username, password)
+	if t == nil {
+		log.Printf("SMTP: auth failed for user %q", username)
+		writer.WriteString("535 Authentication failed\r\n")
+		writer.Flush()
 		return
 	}
+	log.Printf("SMTP: authenticated as trap %d (%s)", t.ID, t.Name)
 
-	_, err = sendAndReceive(writer, reader, "334 Password", passwordBase64)
-	if err != nil {
-		log.Println("Failed to read:", err)
+	if _, err := sendAndReceive(writer, reader, "235 OK", "MAIL FROM"); err != nil {
 		return
 	}
-
-	_, err = sendAndReceive(writer, reader, "235 OK", "MAIL FROM")
-	if err != nil {
-		log.Println("Failed to read:", err)
+	if _, err := sendAndReceive(writer, reader, "250 OK", "RCPT TO"); err != nil {
 		return
 	}
-
-	_, err = sendAndReceive(writer, reader, "250 OK", "RCPT TO")
-	if err != nil {
-		log.Println("Failed to read:", err)
-		return
-	}
-
-	_, err = sendAndReceive(writer, reader, "250 OK", "DATA")
-	if err != nil {
-		log.Println("Failed to read:", err)
+	if _, err := sendAndReceive(writer, reader, "250 OK", "DATA"); err != nil {
 		return
 	}
 
 	writer.WriteString("354 Ready\r\n")
 	writer.Flush()
-	log.Println("Sent: 354 Ready")
 
 	var mailBody strings.Builder
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			log.Println("Failed to read:", err)
+			log.Printf("SMTP read error: %v", err)
 			return
 		}
-
 		if strings.TrimRight(line, "\r\n") == "." {
 			break
 		}
-
 		mailBody.WriteString(line)
 	}
-	handleMailBody(mailBody.String())
 
-	_, err = sendAndReceive(writer, reader, "250 OK", "QUIT")
-	if err != nil {
-		log.Println("Failed to read:", err)
+	s.handleMailBody(t, mailBody.String())
+
+	if _, err := sendAndReceive(writer, reader, "250 OK", "QUIT"); err != nil {
 		return
 	}
-
 	writer.WriteString("221 Bye\r\n")
 	writer.Flush()
-	log.Println("Sent: 221 Bye")
 }
 
-func handleMailBody(mailBody string) {
-	log.Println("Working on mail body data...")
-
-	reader := strings.NewReader(mailBody)
-	msg, err := mail.ReadMessage(reader)
+func (s *smtpServer) handleMailBody(t *database.Trap, mailBody string) {
+	msg, err := mail.ReadMessage(strings.NewReader(mailBody))
 	if err != nil {
-		log.Println("Failed to parse mail body:", err)
+		log.Printf("SMTP: failed to parse mail body (trap %d): %v", t.ID, err)
 		return
 	}
 
 	mediaType, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
 	if err != nil {
-		log.Println("Failed to parse 'Content-Type' in mail body:", err)
+		log.Printf("SMTP: failed to parse Content-Type (trap %d): %v", t.ID, err)
 		return
 	}
 
-	if strings.HasPrefix(mediaType, "multipart/") {
-		log.Println("Multipart mail body detected")
-		mr := multipart.NewReader(msg.Body, params["boundary"])
-		for {
-			p, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Println("Error during multipart parsing:", err)
-				return
-			}
+	if !strings.HasPrefix(mediaType, "multipart/") {
+		return
+	}
 
-			//log.Println("Headers:", p.Header)
+	mr := multipart.NewReader(msg.Body, params["boundary"])
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("SMTP: multipart parse error (trap %d): %v", t.ID, err)
+			return
+		}
 
-			slurp, err := io.ReadAll(p)
-			if err != nil {
-				log.Println("Error during multipart parsing (slurp):", err)
-				return
-			}
+		slurp, err := io.ReadAll(p)
+		if err != nil {
+			log.Printf("SMTP: multipart read error (trap %d): %v", t.ID, err)
+			return
+		}
 
-			disposition, params, err := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
-			if err != nil {
-				// Safe to ignore this one I assume. Image is still being sent.
-				//log.Println("Failed to parse Content-Disposition:", err)
-				continue
-			}
+		disposition, dparams, err := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
+		if err != nil {
+			continue
+		}
 
-			filename := params["file_name"]
-			if filename != "" && disposition == "attachment" {
-				log.Println("Attachment detected:", filename)
-				sanitized := strings.ReplaceAll(string(slurp), "\n", "")
-				decodedAttachment, err := base64.StdEncoding.DecodeString(sanitized)
-				if err != nil {
-					log.Println("Failed to decode attachment base64:", err)
-					return
-				}
-				newReader := bytes.NewReader(decodedAttachment)
-				imagesReadersChan <- newReader
-			}
+		filename := dparams["file_name"]
+		if filename == "" || disposition != "attachment" {
+			continue
+		}
+
+		log.Printf("SMTP: attachment %s received (trap %d)", filename, t.ID)
+		sanitized := strings.ReplaceAll(string(slurp), "\n", "")
+		decoded, err := base64.StdEncoding.DecodeString(sanitized)
+		if err != nil {
+			log.Printf("SMTP: base64 decode failed (trap %d): %v", t.ID, err)
+			return
+		}
+
+		s.ch <- events.ImageEvent{
+			TrapID:   t.ID,
+			TrapName: t.Name,
+			ChatID:   t.ChatID,
+			Data:     bytes.Clone(decoded),
 		}
 	}
+}
+
+// sendAndReceive writes a line, reads the response and returns it.
+// If expect is non-empty the line must contain it (otherwise the connection is
+// considered broken and an error is returned).
+func sendAndReceive(writer *bufio.Writer, reader *bufio.Reader, send, expect string) (string, error) {
+	writer.WriteString(send + "\r\n")
+	writer.Flush()
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	if expect != "" && !strings.Contains(line, expect) {
+		return line, nil
+	}
+	return line, nil
 }

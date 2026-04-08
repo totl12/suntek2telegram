@@ -1,0 +1,13 @@
+services:
+  suntek2telegram:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"       # Web UI
+      # Раскомментируйте порты нужных ловушек, созданных через веб-интерфейс:
+      # - "21:21"           # FTP
+      # - "4100-4199:4100-4199"  # FTP passive ports
+      # - "25:25"           # SMTP
+    volumes:
+      - ./config.yml:/config.yml:ro   # конфиг (только telegram api_key + web)
+      - ./data:/data                  # база SQLite + фотографии
