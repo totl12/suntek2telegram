@@ -1,106 +1,138 @@
 # suntek2telegram
 
-- [Key features](#key-features)
-- [Suntek cameras](#suntek-cameras)
-  * [Configuration](#configuration)
-  * [Issue with FTP implementation](#issue-with-ftp-implementation)
-- [Getting started](#getting-started)
-  * [Requirements](#requirements)
-  * [Configuration - camera](#configuration---camera)
-    + [Preparation](#preparation)
-    + [FTP method](#ftp-method)
-    + [SMTP method](#smtp-method)
-  * [Configuration - suntek2telegram app](#configuration---suntek2telegram-app)
-- [Usage](#usage)
-  * [Docker compose](#docker-compose)
-  * [Binary releases](#binary-releases)
+> **Fork** родительского проекта [erkexzcx/suntek2telegram](https://github.com/erkexzcx/suntek2telegram).  
+> Оригинальная идея и реализация FTP/SMTP-сервера принадлежат автору оригинала.
 
-This application serves as a blackbox FTP and SMTP server specifically designed for Suntek trail cameras, but should work with other SIM-enabled cameras too. Its primary function is to forward the pictures uploaded by the cameras to a designated Telegram (personal or group) chat.
+---
 
-# Key features
+- [Что нового в этом форке](#что-нового-в-этом-форке)
+- [Принцип работы](#принцип-работы)
+- [Настройка камер Suntek](#настройка-камер-suntek)
+  - [Конфигурация MMSCONFIG](#конфигурация-mmsconfig)
+  - [Проблема с FTP](#проблема-с-ftp)
+- [Быстрый старт](#быстрый-старт)
+  - [Требования](#требования)
+  - [Настройка камеры](#настройка-камеры)
+  - [Настройка приложения](#настройка-приложения)
+- [Использование](#использование)
+  - [Docker Compose](#docker-compose)
+  - [Бинарные релизы](#бинарные-релизы)
+- [Веб-интерфейс](#веб-интерфейс)
 
-* **FTP Server**: The FTP server is designed to receive images from the trail cameras. However, it doesn't alter or store any files on the server. It simply acts as a conduit to receive the images and forward them to Telegram.
-* **SMTP Server**: The SMTP server is implemented to make the camera believe it's interacting with a real email service. However, it doesn't send any emails. Its sole purpose is to receive the images from the camera and forward them to Telegram.
+---
 
-In essence, this application acts as a blackbox, mimicking the behavior of real FTP and SMTP servers to receive images from Suntek trail cameras and forward them to Telegram.
+## Что нового в этом форке
 
-# Suntek cameras
+### Поддержка нескольких ловушек (камер)
 
-## Configuration
+В оригинале каждая камера требовала отдельного экземпляра приложения или отдельного порта.  
+В этом форке **один FTP-сервер и один SMTP-сервер обслуживают любое количество камер** — ловушки различаются по логину и паролю, каждая пересылает фото в **свой** Telegram-чат.
 
-This software should work with all Suntek cameras that have SIM card for network connectivity and configured with `MMSCONFIG` software. It can be found online. Google for `MMSCONFIG` and you will find a few results from `cnsuntek.com`.
+### Веб-интерфейс управления
+
+Добавлен встроенный веб-интерфейс (по умолчанию `:8080`):
+
+- **Ловушки** — добавление, редактирование, удаление камер без перезапуска приложения.
+- **История фотографий** — просмотр всех полученных фото с фильтром по ловушке, просмотр в лайтбоксе, удаление.
+- **Статус серверов** — отображение состояния FTP- и SMTP-серверов.
+- Опциональная авторизация (логин/пароль в конфиге).
+
+### Хранение фотографий
+
+Все полученные фотографии сохраняются на диск в директорию `photos_dir` и доступны через веб-интерфейс. В оригинале фото передавались в Telegram «на лету» и нигде не сохранялись.
+
+### SQLite база данных
+
+Конфигурация ловушек и метаданные фотографий хранятся в SQLite (`db_path`). Больше не нужно редактировать YAML вручную для каждой новой камеры.
+
+### Изменения конфигурации
+
+| Параметр | Оригинал | Этот форк |
+|---|---|---|
+| `ftp.username` / `ftp.password` | Один набор на весь сервер | Переехали в каждую ловушку (в БД) |
+| `smtp.username` / `smtp.password` | Один набор на весь сервер | Переехали в каждую ловушку (в БД) |
+| `telegram.chat_id` | Один глобальный чат | Задаётся для каждой ловушки отдельно |
+| `web.*` | Отсутствует | Новый блок для веб-интерфейса |
+| `db_path` | Отсутствует | Путь к SQLite базе данных |
+| `photos_dir` | Отсутствует | Директория для хранения фото |
+
+---
+
+## Принцип работы
+
+Приложение поднимает один общий FTP-сервер и/или один общий SMTP-сервер.  
+Камера подключается к серверу своим логином и паролем — приложение находит нужную ловушку и пересылает полученное фото в Telegram-чат, привязанный к этой ловушке.
+
+```
+Камера 1 (FTP, login: cam1) ──┐
+Камера 2 (FTP, login: cam2) ──┤→  Общий FTP-сервер  ──→  Ловушка 1 → Telegram чат -100111
+Камера 3 (SMTP, login: cam3)──┘→  Общий SMTP-сервер ──→  Ловушка 3 → Telegram чат -100222
+                                                         ↓
+                                                   Сохранение на диск
+                                                   История в веб-интерфейсе
+```
+
+---
+
+## Настройка камер Suntek
+
+### Конфигурация MMSCONFIG
+
+Приложение работает со всеми камерами Suntek с SIM-картой, настраиваемыми через `MMSCONFIG`.  
+Утилиту можно найти на сайте `cnsuntek.com`.
 
 ![preview](https://github.com/erkexzcx/suntek2telegram/blob/main/images/mmsconfig.png?raw=true)
 
-## Issue with FTP implementation
-
-On AliExpress there are handful of trail cameras to pick from. The one I purchased is `Suntek HC900LTE`.
-
-I am a bit too lazy to provide actual logs, but here is how communication works with FTP at first:
-1. Device connects to FTP server.
-2. Gets FTP os info.
-3. Sets current working directory to specified directory in camera's config.
-4. Switches to binary mode.
-5. Switches to passive mode and gets passive port from FTP server.
-6. Uploads file.
-7. Exits.
-
-After 3-48 hours, the implementation _breaks_ and it basically becomes steps 1-3 only. Looking at errors file (on sd card) it shows that it tries to upload, but getting error from modem command, which was translated by ChatGPT to be "FTP server not found". Also tried explicitly closing connection after each uploaded image and notifying FTP client that connection is closing prior that - nothing has worked. This sounds like firmware/software bug which cannot be fixed by me. As usually, Suntek support were almost clueless of what is FTP to begin with, so reaching out to them for assistance is out of question.
-
-Initially this software was written for FTP functionality only, but after giving up with FTP, I decided to look into SMTP method and it worked just great!
-
-# Getting started
-
-## Requirements
-
-Linux server with public IP and Docker.
-
-Suggestions:
-* If you have public IP at home - with some port forwarding and home server (such as RPI) you can easily host this application.
-* Alternatively, feel free to purchase instance at your favorite cloud provider. I prefer `Linode` for their cheapest shared CPU instances.
-
-## Configuration - camera
-
-### Preparation
-
-FTP (at least with my camera) is broken and unusable, so I am stuck with SMTP. Basically decide which one you would like to use. Changing it is easy in this application's configuration, but might be difficult to change in camera (pull out SD card, generate config, upload config, insert SD card etc.)
-
-### FTP method
-
-Here is how configuration looks like:
+**FTP-метод:**
 
 ![preview](https://github.com/erkexzcx/suntek2telegram/blob/main/images/mmsconfig_ftp.png?raw=true)
 
-APN is configured to your SIM provider (for mobile internet) and the rest points to your FTP server.
+APN — провайдер SIM-карты. Остальные поля указывают на ваш FTP-сервер.  
+Логин и пароль задайте произвольно — они же будут использоваться при создании ловушки в веб-интерфейсе.
 
-### SMTP method
-
-Here is how configuration looks like:
+**SMTP-метод:**
 
 ![preview](https://github.com/erkexzcx/suntek2telegram/blob/main/images/mmsconfig_smtp.png?raw=true)
 
-APN is configured to your SIM provider (for mobile internet) and the rest points to your SMTP server. `Email Setting` needs to contain a single random email address.
+Поле `Email Setting` — произвольный email-адрес.  
+Логин и пароль задайте произвольно — они же будут использоваться при создании ловушки в веб-интерфейсе.
 
-## Configuration - suntek2telegram app
+### Проблема с FTP
 
-Create `config.yml` file out of `config.example.yml` file.
+На камере `Suntek HC900LTE` FTP-метод перестаёт работать через 3–48 часов: камера начинает отвечать ошибкой модема «FTP server not found» — это баг прошивки, не приложения.  
+**Рекомендуется использовать SMTP-метод** — он работает стабильно.
 
-Then create Telegram bot and add Telegram API Key as well as ChatID.
+---
 
-Then, if using FTP method:
-1. Ensure `ftp.enabled: true`.
-2. Update `ftp.bind_host` and `ftp.bind_port` if needed.
-3. Set `ftp.username` and `ftp.password` to match of what you configured in camera FTP configuration.
-4. If needed, update `public_ip` and `passive_ports` fields too.
+## Быстрый старт
 
-Or if using SMTP method:
-1. Ensure `smtp.enabled: true`.
-2. Update `smtp.bind_host` and `smtp.bind_port` if needed.
-3. Set `smtp.username` and `smtp.password` to match of what you configured in camera SMTP configuration.
+### Требования
 
-# Usage
+Linux-сервер с публичным IP и Docker (или Go 1.21+ для сборки из исходников).
 
-## Docker compose
+### Настройка камеры
+
+1. Определитесь с методом: FTP или SMTP.
+2. В `MMSCONFIG` укажите IP вашего сервера, порт (21 для FTP, 25 для SMTP) и придумайте логин/пароль.
+3. Загрузите конфиг на камеру.
+
+### Настройка приложения
+
+1. Скопируйте `config.example.yml` в `config.yml`.
+2. Укажите токен Telegram-бота в `telegram.api_key`.
+3. Включите нужный сервер (`ftp.enabled: true` и/или `smtp.enabled: true`).
+4. Для FTP укажите `ftp.public_ip` (ваш публичный IP) и `ftp.passive_ports`.
+5. Запустите приложение.
+6. Откройте веб-интерфейс (`http://<your-ip>:8080`) и добавьте ловушку:
+   - **Тип**: FTP или SMTP
+   - **Логин / Пароль**: те же, что указаны в настройках камеры
+   - **Telegram Chat ID**: ID чата, куда пересылать фото
+
+---
+
+## Использование
+
+### Docker Compose
 
 ```yaml
 services:
@@ -109,14 +141,70 @@ services:
     container_name: suntek2telegram
     restart: always
     volumes:
-      - ./suntek2telegram/config.yml:/config.yml
+      - ./config.yml:/config.yml
+      - ./data:/data         # БД и фотографии
     ports:
-      # You can use any TCP port for FTP or SMTP:
-      - 8123:8123/tcp
-      # Port range is only used for FTP PassivePorts functionality:
-      #- 4100-4199:4100-4199/tcp
+      - "21:21/tcp"          # FTP
+      - "25:25/tcp"          # SMTP
+      - "8080:8080/tcp"      # Веб-интерфейс
+      # Диапазон пассивных портов FTP (если используется):
+      #- "4100-4199:4100-4199/tcp"
 ```
 
-## Binary releases
+Пример `config.yml`:
 
-See [latest release](https://github.com/erkexzcx/suntek2telegram/releases/latest).
+```yaml
+telegram:
+  api_key: "ВАШ_ТОКЕН"
+
+ftp:
+  enabled: true
+  bind_host: "0.0.0.0"
+  bind_port: 21
+  public_ip: "1.2.3.4"
+  passive_ports: "4100-4199"
+
+smtp:
+  enabled: true
+  bind_host: "0.0.0.0"
+  bind_port: 25
+
+web:
+  bind_host: "0.0.0.0"
+  bind_port: 8080
+  username: "admin"
+  password: "changeme"
+
+db_path: "./data/suntek.db"
+photos_dir: "./data/photos"
+```
+
+### Бинарные релизы
+
+Доступны на странице [Releases](https://github.com/erkexzcx/suntek2telegram/releases/latest) оригинального репозитория.  
+Собрать самостоятельно:
+
+```bash
+go build -o suntek2telegram ./cmd/suntek2telegram
+./suntek2telegram -conf config.yml
+```
+
+---
+
+## Веб-интерфейс
+
+После запуска откройте `http://<your-ip>:8080`.
+
+**Вкладка «Ловушки»**
+
+- Статус FTP- и SMTP-серверов (вверху страницы).
+- Таблица камер с типом подключения, логином, Chat ID и статусом активности.
+- Кнопки добавления, редактирования и удаления ловушек. Изменения применяются мгновенно, без перезапуска.
+
+**Вкладка «Фотографии»**
+
+- Сетка всех полученных фото (24 на страницу).
+- Фильтр по ловушке — выберите конкретную камеру из выпадающего списка.
+- Клик по фото открывает лайтбокс.
+- Иконка ✕ удаляет фото из базы данных и с диска.
+- Значки `TG ✓` / `TG ✗` показывают, было ли фото успешно отправлено в Telegram.
